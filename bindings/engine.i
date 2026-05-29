@@ -145,8 +145,6 @@ static void gnc_log_msg(const char *msg)
 static void gnc_log_debug(const char *msg)
 { g_log("gnc.scm", G_LOG_LEVEL_DEBUG, "%s", msg); }
 
-static const GncGUID * gncPriceGetGUID(GNCPrice *x)
-{ return qof_instance_get_guid(QOF_INSTANCE(x)); }
 static const GncGUID * gncBudgetGetGUID(GncBudget *x)
 { return qof_instance_get_guid(QOF_INSTANCE(x)); }
 

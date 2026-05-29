@@ -26,6 +26,7 @@ Boston, MA 02110-1301, USA gnu@gnu.org
 
 '''
 
+import datetime
 import gnucash
 from gnucash.gnucash_business import Entry, Split, Account
 
@@ -304,3 +305,55 @@ def accountToDict(account):
         simple_account['placeholder'] = account.GetPlaceholder()
 
         return simple_account
+
+def commodityToDict(commodity):
+
+    if commodity is None:
+        return None
+
+    simple_commodity = {}
+    simple_commodity['namespace'] = commodity.get_namespace()
+    simple_commodity['mnemonic'] = commodity.get_mnemonic()
+    simple_commodity['fullname'] = commodity.get_fullname()
+    simple_commodity['cusip'] = commodity.get_cusip()
+    simple_commodity['fraction'] = commodity.get_fraction()
+    simple_commodity['quote_flag'] = bool(commodity.get_quote_flag())
+    try:
+        quote_source = commodity.get_quote_source()
+        simple_commodity['quote_source'] = (
+            gnucash.gnucash_core_c.gnc_quote_source_get_internal_name(
+                quote_source)
+            if quote_source is not None else None)
+    except Exception:
+        simple_commodity['quote_source'] = None
+    simple_commodity['quote_tz'] = commodity.get_quote_tz()
+
+    return simple_commodity
+
+def priceToDict(price):
+
+    if price is None:
+        return None
+
+    simple_price = {}
+    simple_price['guid'] = price.GetGUID().to_string()
+    simple_price['commodity'] = commodityToDict(price.get_commodity())
+    simple_price['currency'] = commodityToDict(price.get_currency())
+
+    value = price.get_value()
+    simple_price['value'] = value.to_double()
+    simple_price['value_num'] = value.num()
+    simple_price['value_denom'] = value.denom()
+
+    # The Python binding for get_time64 returns a datetime
+    price_time = price.get_time64()
+    if isinstance(price_time, datetime.datetime):
+        simple_price['date'] = price_time.strftime('%Y-%m-%dT%H:%M:%S')
+    else:
+        simple_price['date'] = datetime.datetime.fromtimestamp(
+            int(price_time)).strftime('%Y-%m-%dT%H:%M:%S')
+
+    simple_price['source'] = price.get_source_string()
+    simple_price['type'] = price.get_typestr()
+
+    return simple_price

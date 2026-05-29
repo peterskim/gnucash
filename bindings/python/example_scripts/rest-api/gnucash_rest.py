@@ -41,6 +41,8 @@ from decimal import Decimal
 from gnucash.gnucash_business import Vendor, Bill, Entry, GncNumeric, \
     Customer, Invoice, Split, Account, Transaction
 
+from gnucash import GncPrice, GncCommodity
+
 import datetime
 
 from gnucash import \
@@ -770,13 +772,156 @@ def api_vendor(id):
 def api_vendor_bills(id):
 
     vendor = getVendor(session.book, id)
-    
+
     if vendor is None:
         abort(404)
-    
+
     bills = getBills(session.book, vendor['guid'], None, None, None, None)
-    
+
     return Response(json.dumps(bills), mimetype='application/json')
+
+@app.route('/commodities', methods=['GET', 'POST'])
+def api_commodities():
+
+    if request.method == 'GET':
+        namespace = request.args.get('namespace', None)
+        commodities = getCommodities(session.book, namespace)
+        return Response(json.dumps(commodities), mimetype='application/json')
+
+    elif request.method == 'POST':
+        namespace = str(request.form.get('namespace', ''))
+        mnemonic = str(request.form.get('mnemonic', ''))
+        fullname = str(request.form.get('fullname', ''))
+        cusip = str(request.form.get('cusip', ''))
+        fraction = request.form.get('fraction', '10000')
+        quote_source = str(request.form.get('quote_source', ''))
+        quote_tz = str(request.form.get('quote_tz', ''))
+
+        try:
+            commodity = addCommodity(session.book, namespace, mnemonic,
+                fullname, cusip, fraction, quote_source, quote_tz)
+        except Error as error:
+            return Response(json.dumps({'errors': [{'type': error.type,
+                'message': error.message, 'data': error.data}]}), status=400,
+                mimetype='application/json')
+        else:
+            return Response(json.dumps(commodity), status=201,
+                mimetype='application/json')
+
+    else:
+        abort(405)
+
+@app.route('/commodities/<namespace>/<mnemonic>', methods=['GET'])
+def api_commodity(namespace, mnemonic):
+
+    commodity = getCommodity(session.book, namespace, mnemonic)
+
+    if commodity is None:
+        abort(404)
+
+    return Response(json.dumps(commodity), mimetype='application/json')
+
+@app.route('/commodities/<namespace>/<mnemonic>/prices/latest',
+    methods=['GET'])
+def api_commodity_price_latest(namespace, mnemonic):
+
+    currency_mnemonic = str(request.args.get('currency_mnemonic', ''))
+
+    try:
+        price = getLatestPrice(session.book, namespace, mnemonic,
+            currency_mnemonic)
+    except Error as error:
+        return Response(json.dumps({'errors': [{'type': error.type,
+            'message': error.message, 'data': error.data}]}), status=400,
+            mimetype='application/json')
+
+    if price is None:
+        abort(404)
+
+    return Response(json.dumps(price), mimetype='application/json')
+
+@app.route('/commodities/<namespace>/<mnemonic>/prices/nearest',
+    methods=['GET'])
+def api_commodity_price_nearest(namespace, mnemonic):
+
+    currency_mnemonic = str(request.args.get('currency_mnemonic', ''))
+    date = str(request.args.get('date', ''))
+
+    try:
+        price = getNearestPrice(session.book, namespace, mnemonic,
+            currency_mnemonic, date)
+    except Error as error:
+        return Response(json.dumps({'errors': [{'type': error.type,
+            'message': error.message, 'data': error.data}]}), status=400,
+            mimetype='application/json')
+
+    if price is None:
+        abort(404)
+
+    return Response(json.dumps(price), mimetype='application/json')
+
+@app.route('/prices', methods=['GET', 'POST'])
+def api_prices():
+
+    if request.method == 'GET':
+        commodity_namespace = request.args.get('commodity_namespace', None)
+        commodity_mnemonic = request.args.get('commodity_mnemonic', None)
+        currency_mnemonic = request.args.get('currency_mnemonic', None)
+        date_from = request.args.get('date_from', None)
+        date_to = request.args.get('date_to', None)
+
+        try:
+            prices = getPrices(session.book, commodity_namespace,
+                commodity_mnemonic, currency_mnemonic, date_from, date_to)
+        except Error as error:
+            return Response(json.dumps({'errors': [{'type': error.type,
+                'message': error.message, 'data': error.data}]}), status=400,
+                mimetype='application/json')
+
+        return Response(json.dumps(prices), mimetype='application/json')
+
+    elif request.method == 'POST':
+        commodity_namespace = str(request.form.get('commodity_namespace', ''))
+        commodity_mnemonic = str(request.form.get('commodity_mnemonic', ''))
+        currency_mnemonic = str(request.form.get('currency_mnemonic', ''))
+        value = str(request.form.get('value', ''))
+        value_num = request.form.get('value_num', None)
+        value_denom = request.form.get('value_denom', None)
+        date = str(request.form.get('date', ''))
+        source = str(request.form.get('source', ''))
+        price_type = str(request.form.get('type', ''))
+
+        try:
+            price = addPrice(session.book, commodity_namespace,
+                commodity_mnemonic, currency_mnemonic, value, value_num,
+                value_denom, date, source, price_type)
+        except Error as error:
+            return Response(json.dumps({'errors': [{'type': error.type,
+                'message': error.message, 'data': error.data}]}), status=400,
+                mimetype='application/json')
+        else:
+            return Response(json.dumps(price), status=201,
+                mimetype='application/json')
+
+    else:
+        abort(405)
+
+@app.route('/prices/<guid>', methods=['GET', 'DELETE'])
+def api_price(guid):
+
+    if request.method == 'GET':
+        price = getPrice(session.book, guid)
+        if price is None:
+            abort(404)
+        return Response(json.dumps(price), mimetype='application/json')
+
+    elif request.method == 'DELETE':
+        if not deletePrice(session.book, guid):
+            abort(404)
+        return Response('', status=204, mimetype='application/json')
+
+    else:
+        abort(405)
 
 def getCustomers(book):
 
@@ -1860,6 +2005,323 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
     transaction.CommitEdit()
 
     return gnucash_simple.transactionToDict(transaction, ['splits'])
+
+def lookupCommodity(book, namespace, mnemonic, field='commodity',
+    error_type='InvalidCommodity'):
+
+    if not namespace:
+        raise Error(error_type,
+            'A commodity namespace must be supplied',
+            {'field': field + '_namespace'})
+    if not mnemonic:
+        raise Error(error_type,
+            'A commodity mnemonic must be supplied',
+            {'field': field + '_mnemonic'})
+
+    commodity = book.get_table().lookup(namespace, mnemonic)
+
+    if commodity is None:
+        raise Error(error_type,
+            'No commodity exists with namespace ' + namespace +
+            ' and mnemonic ' + mnemonic,
+            {'field': field})
+
+    return commodity
+
+def getCommodities(book, namespace=None):
+
+    commod_table = book.get_table()
+
+    if namespace:
+        namespaces = [namespace]
+    else:
+        namespaces = commod_table.get_namespaces()
+
+    result = []
+    for ns in namespaces:
+        for commodity in commod_table.get_commodities(ns):
+            result.append(gnucash_simple.commodityToDict(commodity))
+
+    return result
+
+def getCommodity(book, namespace, mnemonic):
+
+    commodity = book.get_table().lookup(namespace, mnemonic)
+
+    if commodity is None:
+        return None
+
+    return gnucash_simple.commodityToDict(commodity)
+
+def addCommodity(book, namespace, mnemonic, fullname, cusip, fraction,
+    quote_source, quote_tz):
+
+    if not namespace:
+        raise Error('NoCommodityNamespace',
+            'A namespace must be supplied for this commodity',
+            {'field': 'namespace'})
+    if not mnemonic:
+        raise Error('NoCommodityMnemonic',
+            'A mnemonic must be supplied for this commodity',
+            {'field': 'mnemonic'})
+    if not fullname:
+        raise Error('NoCommodityFullname',
+            'A fullname must be supplied for this commodity',
+            {'field': 'fullname'})
+
+    try:
+        fraction = int(fraction)
+    except (TypeError, ValueError):
+        raise Error('InvalidCommodityFraction',
+            'The fraction must be a positive integer',
+            {'field': 'fraction'})
+    if fraction <= 0:
+        raise Error('InvalidCommodityFraction',
+            'The fraction must be a positive integer',
+            {'field': 'fraction'})
+
+    commod_table = book.get_table()
+
+    if commod_table.lookup(namespace, mnemonic) is not None:
+        raise Error('CommodityExists',
+            'A commodity with this namespace and mnemonic already exists',
+            {'field': 'mnemonic'})
+
+    commodity = GncCommodity(book, fullname, namespace, mnemonic, cusip,
+        fraction)
+    inserted = commod_table.insert(commodity)
+
+    if inserted is None:
+        raise Error('CommodityInsertFailed',
+            'The commodity could not be inserted into the commodity table',
+            {'field': 'mnemonic'})
+
+    if quote_source:
+        source = gnucash.gnucash_core_c.gnc_quote_source_lookup_by_internal(
+            quote_source)
+        if source is not None:
+            inserted.set_quote_flag(True)
+            inserted.set_quote_source(source)
+    if quote_tz:
+        inserted.set_quote_tz(quote_tz)
+
+    return gnucash_simple.commodityToDict(inserted)
+
+def _parsePriceDate(date_str, field='date'):
+    try:
+        return datetime.datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        raise Error('InvalidPriceDate',
+            'The date must be provided as YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS',
+            {'field': field})
+
+def _priceMatchesFilter(price, currency_mnemonic, date_from, date_to):
+    if currency_mnemonic:
+        if price.get_currency().get_mnemonic() != currency_mnemonic:
+            return False
+    if date_from or date_to:
+        price_time = price.get_time64()
+        if not isinstance(price_time, datetime.datetime):
+            price_time = datetime.datetime.fromtimestamp(int(price_time))
+        # Compare on date only so a YYYY-MM-DD range is inclusive of whole days.
+        price_date = price_time.date()
+        if date_from and price_date < _parsePriceDate(
+                date_from, 'date_from').date():
+            return False
+        if date_to and price_date > _parsePriceDate(
+                date_to, 'date_to').date():
+            return False
+    return True
+
+def getPrices(book, commodity_namespace, commodity_mnemonic,
+    currency_mnemonic, date_from, date_to):
+
+    pricedb = book.get_price_db()
+    commod_table = book.get_table()
+    result = []
+
+    if commodity_namespace and commodity_mnemonic:
+        commodity = lookupCommodity(book, commodity_namespace,
+            commodity_mnemonic, field='commodity',
+            error_type='InvalidPriceCommodity')
+        commodities = [commodity]
+    else:
+        commodities = []
+        for ns in commod_table.get_namespaces():
+            commodities.extend(commod_table.get_commodities(ns))
+
+    for commodity in commodities:
+        count = pricedb.num_prices(commodity)
+        for i in range(count):
+            price = pricedb.nth_price(commodity, i)
+            if price is None:
+                continue
+            if _priceMatchesFilter(price, currency_mnemonic, date_from,
+                date_to):
+                result.append(gnucash_simple.priceToDict(price))
+
+    return result
+
+# Linear scan - the pricedb has no lookup-by-GUID. Adequate for example use;
+# would need a SWIG-side index for large books.
+def getPrice(book, guid):
+
+    pricedb = book.get_price_db()
+    commod_table = book.get_table()
+
+    for ns in commod_table.get_namespaces():
+        for commodity in commod_table.get_commodities(ns):
+            count = pricedb.num_prices(commodity)
+            for i in range(count):
+                price = pricedb.nth_price(commodity, i)
+                if price is None:
+                    continue
+                if price.GetGUID().to_string() == guid:
+                    return gnucash_simple.priceToDict(price)
+
+    return None
+
+def _findPriceByGUID(book, guid):
+
+    pricedb = book.get_price_db()
+    commod_table = book.get_table()
+
+    for ns in commod_table.get_namespaces():
+        for commodity in commod_table.get_commodities(ns):
+            count = pricedb.num_prices(commodity)
+            for i in range(count):
+                price = pricedb.nth_price(commodity, i)
+                if price is None:
+                    continue
+                if price.GetGUID().to_string() == guid:
+                    return price
+
+    return None
+
+def addPrice(book, commodity_namespace, commodity_mnemonic, currency_mnemonic,
+    value, value_num, value_denom, date, source, price_type):
+
+    commodity = lookupCommodity(book, commodity_namespace, commodity_mnemonic,
+        field='commodity', error_type='InvalidPriceCommodity')
+    currency = lookupCommodity(book, 'CURRENCY', currency_mnemonic,
+        field='currency', error_type='InvalidPriceCurrency')
+
+    if value_num is not None and value_denom is not None:
+        try:
+            num = int(value_num)
+            denom = int(value_denom)
+        except (TypeError, ValueError):
+            raise Error('InvalidPriceValue',
+                'value_num and value_denom must be integers',
+                {'field': 'value_num'})
+        if denom == 0:
+            raise Error('InvalidPriceValue',
+                'value_denom must be non-zero',
+                {'field': 'value_denom'})
+        gnc_value = GncNumeric(num, denom)
+    else:
+        if not value:
+            raise Error('NoPriceValue',
+                'A value must be supplied for this price',
+                {'field': 'value'})
+        try:
+            decimal_value = Decimal(value)
+        except Exception:
+            raise Error('InvalidPriceValue',
+                'value must be a valid decimal number',
+                {'field': 'value'})
+        gnc_value = gnc_numeric_from_decimal(decimal_value)
+
+    if not date:
+        raise Error('NoPriceDate',
+            'A date must be supplied for this price',
+            {'field': 'date'})
+    price_datetime = _parsePriceDate(date)
+
+    # The engine only persists prices whose source matches one of the canonical
+    # strings in gnc-pricedb.cpp's source_names[]. Anything else is silently
+    # dropped, so validate up front.
+    valid_sources = {
+        'user:price-editor', 'Finance::Quote', 'user:price',
+        'user:xfer-dialog', 'user:split-register', 'user:split-import',
+        'user:stock-split', 'user:stock-transaction', 'user:invoice-post',
+    }
+    if source == '':
+        source = 'user:price'
+    elif source not in valid_sources:
+        raise Error('InvalidPriceSource',
+            'source must be one of: ' + ', '.join(sorted(valid_sources)),
+            {'field': 'source'})
+
+    if price_type == '':
+        price_type = 'last'
+
+    price = GncPrice(book)
+    price.begin_edit()
+    price.set_commodity(commodity)
+    price.set_currency(currency)
+    price.set_time64(price_datetime)
+    price.set_value(gnc_value)
+    price.set_source_string(source)
+    price.set_typestr(price_type)
+    price.commit_edit()
+
+    pricedb = book.get_price_db()
+    pricedb.add_price(price)
+
+    return gnucash_simple.priceToDict(price)
+
+def deletePrice(book, guid):
+
+    price = _findPriceByGUID(book, guid)
+    if price is None:
+        return False
+
+    pricedb = book.get_price_db()
+    pricedb.remove_price(price)
+    return True
+
+def getLatestPrice(book, namespace, mnemonic, currency_mnemonic):
+
+    commodity = lookupCommodity(book, namespace, mnemonic,
+        field='commodity', error_type='InvalidPriceCommodity')
+    currency = lookupCommodity(book, 'CURRENCY', currency_mnemonic,
+        field='currency', error_type='InvalidPriceCurrency')
+
+    pricedb = book.get_price_db()
+    price = pricedb.lookup_latest(commodity, currency)
+
+    if price is None:
+        return None
+
+    return gnucash_simple.priceToDict(price)
+
+def getNearestPrice(book, namespace, mnemonic, currency_mnemonic, date):
+
+    commodity = lookupCommodity(book, namespace, mnemonic,
+        field='commodity', error_type='InvalidPriceCommodity')
+    currency = lookupCommodity(book, 'CURRENCY', currency_mnemonic,
+        field='currency', error_type='InvalidPriceCurrency')
+
+    if not date:
+        raise Error('NoPriceDate',
+            'A date must be supplied for the nearest-price lookup',
+            {'field': 'date'})
+
+    price_datetime = _parsePriceDate(date)
+
+    pricedb = book.get_price_db()
+    price = pricedb.lookup_nearest_in_time64(commodity, currency,
+        price_datetime)
+
+    if price is None:
+        return None
+
+    return gnucash_simple.priceToDict(price)
 
 def gnc_numeric_from_decimal(decimal_value):
     sign, digits, exponent = decimal_value.as_tuple()

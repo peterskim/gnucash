@@ -9,8 +9,9 @@ data from Gnucash via a RESTful API.
 The API is built on the existing Python bindings and uses Flask to serve
 responses in JSON.
 
-Currently accounts, transactions, splits, customers, vendors, invoices and
-bills can be accessed to some degree via the framework:
+Currently accounts, transactions, splits, customers, vendors, invoices,
+bills, commodities and prices can be accessed to some degree via the
+framework:
 
 Accounts:
 
@@ -197,6 +198,77 @@ email - optional - the vendor's email address
 
 GET request to /vendors/<id> - returns an individual vendor
 GET request to /vendors/<id>/bills - returns all bills for a single vendor
+
+GET request to /commodities - returns a list of commodities
+
+GET variables:
+namespace - optional - restrict to a single namespace (e.g. CURRENCY, NASDAQ)
+
+POST request to /commodities - creates a new (non-currency) commodity, e.g.
+a stock. ISO currencies are pre-populated and should be looked up rather than
+created.
+
+POST variables:
+namespace - required - the namespace for this commodity (e.g. NASDAQ, AMEX)
+mnemonic - required - the ticker symbol or short code (e.g. AAPL)
+fullname - required - the human-readable name (e.g. "Apple Inc.")
+cusip - optional - the CUSIP or ISIN identifier
+fraction - optional - the smallest tradable fraction as an integer
+(default 10000)
+quote_source - optional - the Finance::Quote source internal name
+(e.g. "yahoo_json")
+quote_tz - optional - the timezone for quote retrieval
+
+GET request to /commodities/<namespace>/<mnemonic> - returns an individual
+commodity
+
+GET request to /commodities/<namespace>/<mnemonic>/prices/latest - returns
+the most recent price for the commodity against a specific currency
+
+GET variables:
+currency_mnemonic - required - the ISO currency code for the quote currency
+
+GET request to /commodities/<namespace>/<mnemonic>/prices/nearest - returns
+the price closest in time to a given date for the commodity
+
+GET variables:
+currency_mnemonic - required - the ISO currency code for the quote currency
+date - required - a date formatted as YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+
+GET request to /prices - returns a list of prices
+
+GET variables:
+commodity_namespace - optional - restrict to a single commodity namespace
+commodity_mnemonic - optional - restrict to a single commodity mnemonic
+(must be combined with commodity_namespace)
+currency_mnemonic - optional - restrict to a single quote currency
+date_from - optional - return prices on and after a date formatted as
+YYYY-MM-DD
+date_to - optional - return prices up to and before a date formatted as
+YYYY-MM-DD
+
+POST request to /prices - creates a new price quote
+
+POST variables:
+commodity_namespace - required - the namespace of the priced commodity
+commodity_mnemonic - required - the mnemonic of the priced commodity
+currency_mnemonic - required - the ISO currency code the price is denominated
+in
+value - required (unless value_num + value_denom are supplied) - the price as
+a decimal string (e.g. 185.42)
+value_num - optional - the numerator of the price as an exact rational, must
+be paired with value_denom
+value_denom - optional - the denominator of the price as an exact rational
+date - required - a date formatted as YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+source - optional - one of the canonical price source strings: "user:price"
+(default), "user:price-editor", "Finance::Quote", "user:xfer-dialog",
+"user:split-register", "user:split-import", "user:stock-split",
+"user:stock-transaction", "user:invoice-post"
+type - optional - one of "last", "bid", "ask", "nav", "unknown" (default
+"last")
+
+GET request to /prices/<guid> - returns an individual price
+DELETE request to /prices/<guid> - removes a price from the price database
 
 Usage
 -----

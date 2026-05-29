@@ -25,6 +25,8 @@ static const GncGUID * gncTransGetGUID(Transaction *x)
 { return qof_instance_get_guid(QOF_INSTANCE(x)); }
 static const GncGUID * gncAccountGetGUID(Account *x)
 { return qof_instance_get_guid(QOF_INSTANCE(x)); }
+static const GncGUID * gncPriceGetGUID(GNCPrice *x)
+{ return qof_instance_get_guid(QOF_INSTANCE(x)); }
 %}
 
 %typemap(newfree) AccountList * "g_list_free($1);"

@@ -994,11 +994,13 @@ gnc_commodity_dict = {
 methods_return_instance(GncCommodity, gnc_commodity_dict)
 
 # GncPrice (deferred until after GncCommodity is defined)
+GncPrice.add_method('gncPriceGetGUID', 'GetGUID')
 gnc_price_dict = {
                     'get_commodity': GncCommodity,
                     'get_currency': GncCommodity,
                     'clone': GncPrice,
                     'get_value': GncNumeric,
+                    'GetGUID': GUID,
                  }
 methods_return_instance(GncPrice, gnc_price_dict)
 
