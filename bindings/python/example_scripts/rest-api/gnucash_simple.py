@@ -127,14 +127,22 @@ def transactionToDict(transaction, entities):
 
         return simple_transaction
 
-def splitToDict(split, entities):
+def splitToDict(split, entities, account_dict=None):
     if split is None:
         return None
     else:
         simple_split = {}
         simple_split['guid'] = split.GetGUID().to_string()
         if 'account' in entities:
-            simple_split['account'] = accountToDict(split.GetAccount())
+            # account_dict lets the caller supply a pre-built (and reused)
+            # account dict so we don't re-serialise the same account for every
+            # split. When absent we fall back to a shallow serialisation rather
+            # than the full recursive accountToDict.
+            if account_dict is not None:
+                simple_split['account'] = account_dict
+            else:
+                simple_split['account'] = accountToDictShallow(
+                    split.GetAccount())
         if 'transaction' in entities:
             simple_split['transaction'] = transactionToDict(
                 split.GetParent(), [])      
@@ -277,6 +285,27 @@ def entryToDict(entry):
 
         return simple_entry
 
+
+def accountToDictShallow(account):
+
+    # A lightweight account serialisation that omits the subaccount recursion
+    # and balance computations of accountToDict. Used when an account is
+    # embedded in another object (e.g. a split) and the full tree/balances are
+    # not needed.
+    if account is None:
+        return None
+    else:
+        simple_account = {}
+        simple_account['name'] = account.GetName()
+        simple_account['type_id'] = account.GetType()
+        simple_account['description'] = account.GetDescription()
+        simple_account['guid'] = account.GetGUID().to_string()
+        if account.GetCommodity() == None:
+            simple_account['currency'] = ''
+        else:
+            simple_account['currency'] = account.GetCommodity().get_mnemonic()
+
+        return simple_account
 
 def accountToDict(account):
 

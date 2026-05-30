@@ -20,6 +20,28 @@ GET request to /accounts/<guid> - returns an individual account
 GET request to /accounts/<guid>/splits - returns splits for an individual
 account
 
+GET vars:
+date_posted_from - optional - only splits whose transaction was posted on or
+after this date (YYYY-MM-DD)
+date_posted_to - optional - only splits whose transaction was posted on or
+before this date (YYYY-MM-DD)
+limit - optional - maximum number of splits to return (default 100, capped at
+500)
+offset - optional - number of splits to skip before returning results (default
+0), used together with limit for pagination
+include - optional - comma-separated list of related objects to embed in each
+split; supported values are "transaction" and "other_split" (default
+"transaction,other_split"). Pass an empty value to omit both.
+
+The response is an object of the form:
+{"splits": [...], "total": <total matching splits>, "limit": <limit>,
+"offset": <offset>}
+
+Splits are sorted by transaction posted date (oldest first) so that paging with
+limit/offset is consistent. The account embedded in each split is a shallow
+representation (guid, name, type_id, description, currency) - it does not
+include subaccounts or balances; use GET /accounts/<guid> for those.
+
 POST request to /accounts - creates a new account
 
 POST variables:

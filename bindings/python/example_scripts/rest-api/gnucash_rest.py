@@ -43,6 +43,8 @@ from gnucash.gnucash_business import Vendor, Bill, Entry, GncNumeric, \
 
 from gnucash import GncPrice, GncCommodity
 
+from gnucash import gnucash_core_c
+
 import datetime
 
 from gnucash import \
@@ -126,16 +128,51 @@ def api_account_splits(guid):
     date_posted_from = request.args.get('date_posted_from', None)
     date_posted_to = request.args.get('date_posted_to', None)
 
+    # Pagination. limit defaults to 100 and is capped at 500; offset defaults
+    # to 0. Invalid values fall back to the defaults rather than erroring.
+    try:
+        limit = int(request.args.get('limit', 100))
+    except ValueError:
+        limit = 100
+    if limit < 0:
+        limit = 100
+    if limit > 500:
+        limit = 500
+
+    try:
+        offset = int(request.args.get('offset', 0))
+    except ValueError:
+        offset = 0
+    if offset < 0:
+        offset = 0
+
+    # Optional comma-separated list controlling which related objects are
+    # embedded in each split. Defaults to the historic behaviour of including
+    # the parent transaction and the other split.
+    include_arg = request.args.get('include', None)
+    if include_arg is None:
+        include = set(['transaction', 'other_split'])
+    else:
+        include = set(part for part in include_arg.split(',') if part != '')
+
     # check account exists
     account = getAccount(session.book, guid)
 
     if account is None:
         abort(404)
 
-    splits = getAccountSplits(session.book, guid, date_posted_from,
-        date_posted_to)
-    
-    return Response(json.dumps(splits), mimetype='application/json')
+    # The queried account is the same for every split in the result, so build a
+    # shallow account dict once (from the dict getAccount already computed) and
+    # reuse it for every row instead of re-serialising the account each time.
+    account_dict = dict((key, account[key]) for key in
+        ('guid', 'name', 'type_id', 'description', 'currency')
+        if key in account)
+
+    splits, total = getAccountSplits(session.book, guid, date_posted_from,
+        date_posted_to, limit, offset, include, account_dict)
+
+    return Response(json.dumps({'splits': splits, 'total': total,
+        'limit': limit, 'offset': offset}), mimetype='application/json')
 
 
 @app.route('/transactions', methods=['POST'])
@@ -1060,9 +1097,10 @@ def getTransactions(book, account_guid, date_posted_from, date_posted_to):
 
     return transactions
 
-def getAccountSplits(book, guid, date_posted_from, date_posted_to):
+def getAccountSplits(book, guid, date_posted_from, date_posted_to, limit,
+    offset, include, account_dict):
 
-    account_guid = gnucash.gnucash_core.GUID() 
+    account_guid = gnucash.gnucash_core.GUID()
     gnucash.gnucash_core.GUIDString(guid, account_guid)
 
     query = gnucash.Query()
@@ -1086,7 +1124,7 @@ def getAccountSplits(book, guid, date_posted_from, date_posted_to):
                 date_posted_to, "%Y-%m-%d").date())
         param_list = [SPLIT_TRANS, TRANS_DATE_POSTED]
         query.add_term(param_list, pred_data, QOF_QUERY_AND)
-    
+
     SPLIT_ACCOUNT = 'account'
     QOF_PARAM_GUID = 'guid'
 
@@ -1095,16 +1133,38 @@ def getAccountSplits(book, guid, date_posted_from, date_posted_to):
         query.add_guid_match(
             [SPLIT_ACCOUNT, QOF_PARAM_GUID], account_guid, QOF_QUERY_AND)
 
+    # Sort by the transaction's posted date, with the split's own guid as a
+    # stable tiebreaker, so that limit/offset paging returns consistent,
+    # non-overlapping pages. The Query class doesn't bind these so we call the
+    # underlying qof_query functions on the raw query pointer. An empty list
+    # marshals to NULL, i.e. no tertiary sort key.
+    gnucash_core_c.qof_query_set_sort_order(
+        query.instance, [SPLIT_TRANS, TRANS_DATE_POSTED], [QOF_PARAM_GUID], [])
+    gnucash_core_c.qof_query_set_sort_increasing(
+        query.instance, True, True, True)
+
+    # query.run() materialises split pointers cheaply; the expense is the
+    # per-split serialisation below, so slice to the requested page first and
+    # only serialise that window.
+    results = query.run()
+    total = len(results)
+
+    entities = ['account']
+    if 'transaction' in include:
+        entities.append('transaction')
+    if 'other_split' in include:
+        entities.append('other_split')
+
     splits = []
 
-    for split in query.run():
+    for split in results[offset:offset + limit]:
         splits.append(gnucash_simple.splitToDict(
             gnucash.gnucash_business.Split(instance=split),
-            ['account', 'transaction', 'other_split']))
+            entities, account_dict))
 
     query.destroy()
 
-    return splits
+    return splits, total
 
 def getInvoices(book, customer, is_paid, is_active, date_due_from,
     date_due_to):
