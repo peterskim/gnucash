@@ -42,6 +42,13 @@ limit/offset is consistent. The account embedded in each split is a shallow
 representation (guid, name, type_id, description, currency) - it does not
 include subaccounts or balances; use GET /accounts/<guid> for those.
 
+Each split includes its reconciliation status:
+reconcile_state - the raw single-char flag ("n" not reconciled, "c" cleared,
+"y" reconciled, "f" frozen, "v" void)
+reconcile_state_label - a human-readable form of reconcile_state
+reconcile_date - the date the split was reconciled or cleared (YYYY-MM-DD), or
+null when it is neither
+
 POST request to /accounts - creates a new account
 
 POST variables:

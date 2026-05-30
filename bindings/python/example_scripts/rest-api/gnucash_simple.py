@@ -30,6 +30,17 @@ import datetime
 import gnucash
 from gnucash.gnucash_business import Entry, Split, Account
 
+# Maps the single-char reconcile flag returned by Split.GetReconcile() to a
+# human-readable status. Mirrors the CREC/YREC/FREC/NREC/VREC defines in
+# libgnucash/engine/Split.h.
+RECONCILE_STATE_LABELS = {
+    'n': 'not_reconciled',
+    'c': 'cleared',
+    'y': 'reconciled',
+    'f': 'frozen',
+    'v': 'void',
+}
+
 def addressToDict(address):
     if address is None:
         return None
@@ -155,6 +166,27 @@ def splitToDict(split, entities, account_dict=None):
         simple_split['cleared_balance'] = split.GetClearedBalance().to_double()
         simple_split['reconciled_balance'] = split.GetReconciledBalance(
             ).to_double()
+
+        # Reconciliation status. GetReconcile() returns a single-char flag
+        # ('n' not reconciled, 'c' cleared, 'y' reconciled, 'f' frozen, 'v'
+        # void); we also expose a human-readable label and, when the split has
+        # actually been reconciled/cleared, the date that happened.
+        reconcile_state = split.GetReconcile()
+        simple_split['reconcile_state'] = reconcile_state
+        simple_split['reconcile_state_label'] = RECONCILE_STATE_LABELS.get(
+            reconcile_state, 'unknown')
+        # A reconcile date is only stored when one was actually recorded, and it
+        # is independent of the current state (most 'c' splits and the synthetic
+        # 'y' opening balances in this book have none). GetDateReconciled() returns
+        # the Unix epoch when unset; depending on the server's timezone that
+        # renders as 1969-12-31 or 1970-01-01, so treat any epoch-era value as "no
+        # date" rather than emitting a bogus date.
+        if reconcile_state in ('y', 'c'):
+            d = split.GetDateReconciled()
+            reconcile_date = d.strftime('%Y-%m-%d') if d.year > 1970 else None
+        else:
+            reconcile_date = None
+        simple_split['reconcile_date'] = reconcile_date
 
         return simple_split
 def invoiceToDict(invoice):
