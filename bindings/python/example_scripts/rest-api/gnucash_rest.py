@@ -278,9 +278,9 @@ def api_transactions():
         num = str(request.form.get('num', ''))
         date_posted = str(request.form.get('date_posted', ''))
 
-        splitvalue1 = int(request.form.get('splitvalue1', ''))
+        splitvalue1 = str(request.form.get('splitvalue1', ''))
         splitaccount1 = str(request.form.get('splitaccount1', ''))
-        splitvalue2 = int(request.form.get('splitvalue2', ''))
+        splitvalue2 = str(request.form.get('splitvalue2', ''))
         splitaccount2 = str(request.form.get('splitaccount2', ''))
 
         splits = [
@@ -293,6 +293,13 @@ def api_transactions():
         except Error as error:
             return Response(json.dumps({'errors': [{'type' : error.type,
                 'message': error.message, 'data': error.data}]}), status=400,
+                mimetype='application/json')
+        except Exception as error:
+            # The engine raises plain Python exceptions (ValueError,
+            # AttributeError, ...) that aren't our custom Error. Return them as
+            # JSON 500s rather than letting Flask emit an opaque HTML page.
+            return Response(json.dumps({'errors': [{'type': 'TransactionError',
+                'message': str(error), 'data': {}}]}), status=500,
                 mimetype='application/json')
         else:
             return Response(json.dumps(transaction), status=201,
@@ -321,10 +328,10 @@ def api_transaction(guid):
         date_posted = str(request.form.get('date_posted', ''))
 
         splitguid1 = str(request.form.get('splitguid1', ''))
-        splitvalue1 = int(request.form.get('splitvalue1', ''))
+        splitvalue1 = str(request.form.get('splitvalue1', ''))
         splitaccount1 = str(request.form.get('splitaccount1', ''))
         splitguid2 = str(request.form.get('splitguid2', ''))
-        splitvalue2 = int(request.form.get('splitvalue2', ''))
+        splitvalue2 = str(request.form.get('splitvalue2', ''))
         splitaccount2 = str(request.form.get('splitaccount2', ''))
 
         splits = [
@@ -342,6 +349,11 @@ def api_transaction(guid):
         except Error as error:
             return Response(json.dumps({'errors': [{'type' : error.type,
                 'message': error.message, 'data': error.data}]}), status=400, mimetype='application/json')
+        except Exception as error:
+            # See api_transactions: surface engine exceptions as JSON 500s.
+            return Response(json.dumps({'errors': [{'type': 'TransactionError',
+                'message': str(error), 'data': {}}]}), status=500,
+                mimetype='application/json')
         else:
             return Response(json.dumps(transaction), status=200,
                 mimetype='application/json')
@@ -2151,11 +2163,39 @@ def addAccount(book, name, currency_mnumonic, account_type_id,
 
     return gnucash_simple.accountToDict(account)
 
+def _split_value_to_numeric(raw):
+    """Convert a split value from the request form into a GncNumeric.
+
+    The web client sends the value as a decimal string in the transaction
+    currency's *major* units (e.g. "-1.23", "5") - not as a hardcoded count of
+    cents. Anything that isn't a finite decimal raises Error (-> HTTP 400)
+    rather than escaping as an uncaught ValueError (-> opaque 500).
+    """
+    try:
+        value = Decimal(raw)
+    except (ArithmeticError, ValueError, TypeError):
+        value = None
+    if value is None or not value.is_finite():
+        raise Error('InvalidSplitValue',
+            'A valid decimal value must be supplied for this split',
+            {'field': 'value'})
+    return gnc_numeric_from_decimal(value)
+
+def _set_split_value(split, account, value, currency):
+    """Set a split's value (in transaction currency) and, when the account is
+    denominated in that same currency, its amount too. GnuCash derives account
+    balances from split *amounts* (in the account's own commodity), so a split
+    with a value but no amount would leave the account balance unchanged. For a
+    foreign-commodity account the amount needs an exchange rate we don't have
+    here, so we leave it for the user; the value still keeps the txn balanced."""
+    split.SetValue(value)
+    # GetCommodity() is None for accounts that hold no commodity (the book root,
+    # and some placeholder accounts); guard so we never dereference None.
+    commodity = account.GetCommodity()
+    if commodity is not None and commodity.equiv(currency):
+        split.SetAmount(value)
+
 def addTransaction(book, num, description, date_posted, currency_mnumonic, splits):
-
-    transaction = Transaction(book)
-
-    transaction.BeginEdit()
 
     commod_table = book.get_table()
     currency = commod_table.lookup('CURRENCY', currency_mnumonic)
@@ -2172,9 +2212,11 @@ def addTransaction(book, num, description, date_posted, currency_mnumonic, split
             'The date posted must be provided in the form YYYY-MM-DD',
             {'field': 'date_posted'})
 
-
+    # Resolve and validate every split BEFORE opening the transaction for edit,
+    # so a bad request can't leave a half-built transaction stuck in BeginEdit.
+    resolved = []
     for split_values in splits:
-        account_guid = gnucash.gnucash_core.GUID() 
+        account_guid = gnucash.gnucash_core.GUID()
         gnucash.gnucash_core.GUIDString(split_values['account_guid'], account_guid)
 
         account = account_guid.AccountLookup(book)
@@ -2184,18 +2226,31 @@ def addTransaction(book, num, description, date_posted, currency_mnumonic, split
                 'A valid account must be supplied for this split',
                 {'field': 'account'})
 
-        split = Split(book)
-        split.SetValue(GncNumeric(split_values['value'], 100))
-        split.SetAccount(account)
-        split.SetParent(transaction)
+        value = _split_value_to_numeric(split_values['value'])
+        resolved.append((account, value))
 
-    transaction.SetCurrency(currency)
-    transaction.SetDescription(description)
-    transaction.SetNum(num)
+    transaction = Transaction(book)
+    transaction.BeginEdit()
+    try:
+        # Set the currency before adding splits so each split's value is stored
+        # against the right denominator.
+        transaction.SetCurrency(currency)
 
-    transaction.SetDatePostedTS(date_posted)
+        for account, value in resolved:
+            split = Split(book)
+            split.SetParent(transaction)
+            split.SetAccount(account)
+            _set_split_value(split, account, value, currency)
 
-    transaction.CommitEdit()
+        transaction.SetDescription(description)
+        transaction.SetNum(num)
+        transaction.SetDate(date_posted.day, date_posted.month, date_posted.year)
+
+        transaction.CommitEdit()
+    except Exception:
+        # Never leave the transaction open if an engine call fails mid-build.
+        transaction.RollbackEdit()
+        raise
 
     return gnucash_simple.transactionToDict(transaction, ['splits'])
 
@@ -2224,8 +2279,6 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
             'A transaction with this GUID does not exist',
             {'field': 'guid'})
 
-    transaction.BeginEdit()
-
     commod_table = book.get_table()
     currency = commod_table.lookup('CURRENCY', currency_mnumonic)
 
@@ -2234,7 +2287,6 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
             'A valid currency must be supplied for this transaction',
             {'field': 'currency'})
 
-
     try:
         date_posted = datetime.datetime.strptime(date_posted, "%Y-%m-%d")
     except ValueError:
@@ -2242,19 +2294,67 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
             'The date posted must be provided in the form YYYY-MM-DD',
             {'field': 'date_posted'})
 
-    for split_values in splits:
+    # Each incoming spec must be matched to an engine Split to re-value in place
+    # (which preserves that split's reconcile state and memo). Two ways to match:
+    #   - by guid, when the caller supplies splitguid* for EVERY split; or
+    #   - by position, pairing the specs with the transaction's existing splits
+    #     sorted by ascending value -- the same "from"(negative)/"to"(positive)
+    #     ordering the web editor derives. This lets clients that don't track
+    #     split guids (e.g. the web app) edit a transaction without a 400.
+    # Mixed (some guids, some not) is rejected: it would otherwise silently fall
+    # back to position matching and could re-value the wrong split.
+    guids = [s.get('guid') for s in splits]
+    if all(guids):
+        use_guids = True
+    elif any(guids):
+        raise Error('MixedSplitGuids',
+            'Either supply a guid for every split or for none of them',
+            {'field': 'guid'})
+    else:
+        use_guids = False
 
-        split_guid = gnucash.gnucash_core.GUID() 
-        gnucash.gnucash_core.GUIDString(split_values['guid'], split_guid)
+    if not use_guids:
+        # Pairing specs with existing splits needs an equal count so we never
+        # strand an existing split (which would unbalance the transaction).
+        existing_sorted = sorted(transaction.GetSplitList(),
+            key=lambda s: s.GetValue().to_double())
+        if len(existing_sorted) != len(splits):
+            raise Error('SplitCountMismatch',
+                'This transaction has %d splits; editing it requires either '
+                'the same number of splits or a guid for each split.'
+                % len(existing_sorted),
+                {'field': 'splits'})
 
-        split = split_guid.SplitLookup(book)
+    # Resolve every (split, account, value) BEFORE opening the transaction for
+    # edit, so a bad request can't leave it stuck in BeginEdit.
+    transaction_guid_str = transaction.GetGUID().to_string()
+    resolved = []
+    for index, split_values in enumerate(splits):
 
-        if split is None:
-            raise Error('InvalidSplitGuid',
-                'A valid guid must be supplied for this split',
-                {'field': 'guid'})
+        if use_guids:
+            split_guid = gnucash.gnucash_core.GUID()
+            gnucash.gnucash_core.GUIDString(split_values['guid'], split_guid)
 
-        account_guid = gnucash.gnucash_core.GUID() 
+            split = split_guid.SplitLookup(book)
+
+            if split is None:
+                raise Error('InvalidSplitGuid',
+                    'A valid guid must be supplied for this split',
+                    {'field': 'guid'})
+
+            # The split must already belong to THIS transaction; otherwise
+            # SetParent below would silently move it out of its own
+            # transaction, unbalancing both.
+            parent = split.GetParent()
+            if parent is None or \
+                    parent.GetGUID().to_string() != transaction_guid_str:
+                raise Error('InvalidSplitGuid',
+                    'This split does not belong to the transaction being edited',
+                    {'field': 'guid'})
+        else:
+            split = existing_sorted[index]
+
+        account_guid = gnucash.gnucash_core.GUID()
         gnucash.gnucash_core.GUIDString(
             split_values['account_guid'], account_guid)
 
@@ -2265,17 +2365,28 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
                 'A valid account must be supplied for this split',
                 {'field': 'account'})
 
-        split.SetValue(GncNumeric(split_values['value'], 100))
-        split.SetAccount(account)
-        split.SetParent(transaction)
+        value = _split_value_to_numeric(split_values['value'])
+        resolved.append((split, account, value))
 
-    transaction.SetCurrency(currency)
-    transaction.SetDescription(description)
-    transaction.SetNum(num)
+    transaction.BeginEdit()
+    try:
+        # Set the currency before re-valuing splits so values store against the
+        # right denominator (matches addTransaction).
+        transaction.SetCurrency(currency)
 
-    transaction.SetDatePostedTS(date_posted)
+        for split, account, value in resolved:
+            split.SetAccount(account)
+            split.SetParent(transaction)
+            _set_split_value(split, account, value, currency)
 
-    transaction.CommitEdit()
+        transaction.SetDescription(description)
+        transaction.SetNum(num)
+        transaction.SetDate(date_posted.day, date_posted.month, date_posted.year)
+
+        transaction.CommitEdit()
+    except Exception:
+        transaction.RollbackEdit()
+        raise
 
     return gnucash_simple.transactionToDict(transaction, ['splits'])
 
