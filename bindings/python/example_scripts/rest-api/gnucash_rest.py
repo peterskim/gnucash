@@ -84,6 +84,19 @@ from gnucash import SessionOpenMode
 app = Flask(__name__)
 app.debug = True
 
+@app.before_request
+def require_session():
+
+    # Every route below dereferences the global `session` (directly or via a
+    # helper). A failed POST /revert can leave `session` as None, so fail fast
+    # here with a clean 503 rather than crashing deep in a handler with an
+    # AttributeError. /revert is exempt so it can be retried to recover.
+    if session is None and request.endpoint != 'api_revert':
+        return Response(json.dumps({'errors': [{'type': 'NoSession',
+            'message': 'No active GnuCash session; the book failed to '
+            're-open. Retry POST /revert to recover.', 'data': ''}]}),
+            status=503, mimetype='application/json')
+
 @app.route('/accounts', methods=['GET', 'POST'])
 def api_accounts():
 
@@ -1039,6 +1052,63 @@ def api_price(guid):
 
     else:
         abort(405)
+
+@app.route('/save', methods=['POST'])
+def api_save():
+
+    # Flush all in-memory changes to the backend. Without this the book is
+    # only persisted when the server shuts down cleanly (see shutdown()).
+    try:
+        session.save()
+    except gnucash.GnuCashBackendException as error:
+        return Response(json.dumps({'errors': [{'type':
+            'GnuCashBackendException', 'message':
+            'Failed to save the book to the backend.',
+            'data': str(error)}]}), status=500,
+            mimetype='application/json')
+
+    return Response('', status=204, mimetype='application/json')
+
+@app.route('/revert', methods=['POST'])
+def api_revert():
+
+    # Discard all unsaved in-memory changes by ending the current session
+    # without saving and re-opening it, which re-reads the book from the
+    # backend. There is no native in-place revert in qof (re-loading a session
+    # requires an empty book), so the session is recreated -- the same approach
+    # the GnuCash GUI takes in gnc_file_revert().
+    global session
+
+    # The old session must be torn down before a new one can lock the backend,
+    # so there is an unavoidable window with no usable session. Drop the global
+    # reference up front so a failure part-way through never leaves `session`
+    # pointing at a half-destroyed object.
+    old_session, session = session, None
+
+    if old_session is not None:
+        try:
+            old_session.end()
+            old_session.destroy()
+        except gnucash.GnuCashBackendException:
+            # Best effort -- the backend is going away regardless. Fall through
+            # and still try to re-open a fresh session below.
+            pass
+
+    # Re-open to re-read the book. If this fails, `session` stays None and the
+    # require_session guard turns every other route into a clean 503 until a
+    # later /revert succeeds.
+    try:
+        session = gnucash.Session(connection_string,
+            SessionOpenMode.SESSION_BREAK_LOCK)
+    except gnucash.GnuCashBackendException as error:
+        return Response(json.dumps({'errors': [{'type':
+            'GnuCashBackendException', 'message':
+            'Reverted in-memory changes but failed to re-open the book; the '
+            'server has no active session until POST /revert succeeds.',
+            'data': str(error)}]}), status=503,
+            mimetype='application/json')
+
+    return Response('', status=204, mimetype='application/json')
 
 def getCustomers(book):
 
@@ -2546,9 +2616,12 @@ def gnc_numeric_from_decimal(decimal_value):
     return GncNumeric(numerator, denominator)
 
 def shutdown():
-    session.save()
-    session.end()
-    session.destroy()
+    # session may be None if a POST /revert failed to re-open the book; guard
+    # so the atexit handler can't crash on exit in that degraded state.
+    if session is not None:
+        session.save()
+        session.end()
+        session.destroy()
     print('Shutdown')
 
 class Error(Exception):
@@ -2585,9 +2658,12 @@ for option, value in options:
         is_new = True
 
 
+# connection string from the command line, reused by /revert to re-open
+connection_string = arguments[0]
+
 #start gnucash session base on connection string argument
 if is_new:
-    session = gnucash.Session(arguments[0], SessionOpenMode.SESSION_NEW_STORE)
+    session = gnucash.Session(connection_string, SessionOpenMode.SESSION_NEW_STORE)
 
     # seem to get errors if we use the session directly, so save it and
     #destroy it so it's no longer new
@@ -2596,8 +2672,8 @@ if is_new:
     session.end()
     session.destroy()
 
-# unsure about SESSION_BREAK_LOCK - it used to be ignore_lock=True 
-session = gnucash.Session(arguments[0], SessionOpenMode.SESSION_BREAK_LOCK)
+# unsure about SESSION_BREAK_LOCK - it used to be ignore_lock=True
+session = gnucash.Session(connection_string, SessionOpenMode.SESSION_BREAK_LOCK)
 
 # register method to close gnucash connection gracefully
 atexit.register(shutdown)
@@ -2613,4 +2689,14 @@ if not app.debug:
     app.logger.addHandler(stream_handler)
 
 # start Flask server
-app.run(host=host)
+#
+# threaded=False is required, not optional: the whole app shares a single
+# global GnuCash session/book and the qof engine is not thread-safe. Flask's
+# app.run() sets threaded=True by default, which would let concurrent requests
+# mutate the shared book underneath each other -- and a POST /revert could
+# end()/destroy() the session while another in-flight request is using
+# session.book. Serving one request at a time serialises /revert with every
+# other handler and removes that whole class of races. (Note: this only holds
+# within a single process; do not run this example under a multi-worker WSGI
+# server such as gunicorn, where the workers would fight over the backend lock.)
+app.run(host=host, threaded=False)

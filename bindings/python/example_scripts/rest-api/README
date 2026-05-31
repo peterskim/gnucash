@@ -342,6 +342,17 @@ type - optional - one of "last", "bid", "ask", "nav", "unknown" (default
 GET request to /prices/<guid> - returns an individual price
 DELETE request to /prices/<guid> - removes a price from the price database
 
+POST request to /save - flushes all in-memory changes to the backend. Changes
+made through the API are otherwise only persisted when the server shuts down
+cleanly. Returns 204 on success.
+
+POST request to /revert - discards all unsaved in-memory changes and re-reads
+the book from the backend. This ends and re-opens the session, so any changes
+made since the server started (or since the last /save) are lost. Returns 204
+on success. If re-opening the book fails the server is left with no active
+session and returns 503; all other routes then return 503 until a subsequent
+POST /revert succeeds in re-opening the book.
+
 Usage
 -----
 
@@ -357,6 +368,12 @@ Rrun `python ./gnucash_rest <connection string>` to start the server on
 
 Navigate to <http://localhost:5000/invoices> and you should get your invoices
 in JSON format.
+
+The server shares a single GnuCash session across all requests and the
+underlying engine is not thread-safe, so it runs single-threaded (one request
+at a time) on purpose. Do not run it under a multi-worker/multi-threaded WSGI
+server (e.g. gunicorn with several workers), as the workers would race on the
+shared book and fight over the backend lock.
 
 Files
 -----
