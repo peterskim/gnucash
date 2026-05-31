@@ -64,10 +64,14 @@ from gnucash import \
     QOF_COMPARE_EQUAL, \
     QOF_COMPARE_GT, \
     QOF_COMPARE_GTE, \
-    QOF_COMPARE_NEQ
+    QOF_COMPARE_NEQ, \
+    QOF_COMPARE_CONTAINS
 
 from gnucash import \
     QOF_DATE_MATCH_NORMAL
+
+from gnucash import \
+    QOF_NUMERIC_MATCH_ANY
 
 from gnucash import \
     INVOICE_TYPE
@@ -170,6 +174,82 @@ def api_account_splits(guid):
 
     splits, total = getAccountSplits(session.book, guid, date_posted_from,
         date_posted_to, limit, offset, include, account_dict)
+
+    return Response(json.dumps({'splits': splits, 'total': total,
+        'limit': limit, 'offset': offset}), mimetype='application/json')
+
+
+@app.route('/accounts/<guid>/splits/search', methods=['GET'])
+def api_account_splits_search(guid):
+
+    # Optional filters: description (free-text), date_posted_from/to and
+    # amount_from/to ranges. Any combination may be supplied and they are
+    # AND-combined; an absent or empty value means "no constraint".
+    description = request.args.get('description', None) or None
+    date_posted_from = request.args.get('date_posted_from', None) or None
+    date_posted_to = request.args.get('date_posted_to', None) or None
+    amount_from = request.args.get('amount_from', None) or None
+    amount_to = request.args.get('amount_to', None) or None
+
+    # Search this account only, or this account and all of its descendants.
+    include_children = request.args.get('include_children', '').lower() in (
+        'true', '1', 'yes')
+
+    # Pagination. limit defaults to 100 and is capped at 500; offset defaults
+    # to 0. Invalid values fall back to the defaults rather than erroring.
+    try:
+        limit = int(request.args.get('limit', 100))
+    except ValueError:
+        limit = 100
+    if limit < 0:
+        limit = 100
+    if limit > 500:
+        limit = 500
+
+    try:
+        offset = int(request.args.get('offset', 0))
+    except ValueError:
+        offset = 0
+    if offset < 0:
+        offset = 0
+
+    # Optional comma-separated list controlling which related objects are
+    # embedded in each split. Defaults to including the parent transaction and
+    # the other split, matching the plain splits endpoint.
+    include_arg = request.args.get('include', None)
+    if include_arg is None:
+        include = set(['transaction', 'other_split'])
+    else:
+        include = set(part for part in include_arg.split(',') if part != '')
+
+    # check account exists
+    account = getAccount(session.book, guid)
+
+    if account is None:
+        abort(404)
+
+    # When searching across child accounts each result may belong to a
+    # different account, so let splitToDict serialise each split's own account.
+    # For a single-account search every row shares the queried account, so build
+    # that shallow dict once and reuse it for every row.
+    if include_children:
+        account_dict = None
+    else:
+        account_dict = dict((key, account[key]) for key in
+            ('guid', 'name', 'type_id', 'description', 'currency')
+            if key in account)
+
+    # The query helper parses the date strings and amount values; surface
+    # malformed input as a 400 rather than letting it become a 500.
+    try:
+        splits, total = getAccountSplits(session.book, guid, date_posted_from,
+            date_posted_to, limit, offset, include, account_dict, description,
+            amount_from, amount_to, include_children)
+    except (ValueError, ArithmeticError):
+        return Response(json.dumps({'errors': [{'type': 'InvalidSearch',
+            'message': 'date_posted_from/to must be formatted YYYY-MM-DD and '
+            'amount_from/to must be numeric', 'data': None}]}), status=400,
+            mimetype='application/json')
 
     return Response(json.dumps({'splits': splits, 'total': total,
         'limit': limit, 'offset': offset}), mimetype='application/json')
@@ -1098,18 +1178,53 @@ def getTransactions(book, account_guid, date_posted_from, date_posted_to):
     return transactions
 
 def getAccountSplits(book, guid, date_posted_from, date_posted_to, limit,
-    offset, include, account_dict):
+    offset, include, account_dict, description=None, amount_from=None,
+    amount_to=None, include_children=False):
+
+    SPLIT_TRANS = 'trans'
+    TRANS_DATE_POSTED = 'date-posted'
+    TRANS_DESCRIPTION = 'desc'
+    SPLIT_ACCOUNT = 'account'
+    SPLIT_VALUE = 'amount'
+    QOF_PARAM_GUID = 'guid'
 
     account_guid = gnucash.gnucash_core.GUID()
     gnucash.gnucash_core.GUIDString(guid, account_guid)
+
+    account = account_guid.AccountLookup(book)
+    if account is None:
+        return [], 0
 
     query = gnucash.Query()
     query.search_for('Split')
     query.set_book(book)
 
-    SPLIT_TRANS= 'trans'
+    # The set of accounts the search covers: just this account, or this account
+    # plus every descendant when include_children is requested.
+    if include_children:
+        accounts = [account] + account.get_descendants()
+    else:
+        accounts = [account]
 
-    TRANS_DATE_POSTED = 'date-posted'
+    # Add the account match FIRST, before the date/description/amount filters.
+    # qof stores a query in disjunctive normal form (an OR of AND-groups): a
+    # term added with QOF_QUERY_AND is cross-producted into every existing
+    # AND-group, while QOF_QUERY_OR starts a new group. Building the accounts as
+    # an OR-group up front and then AND-ing the filters distributes each filter
+    # across every account, yielding (acctA OR acctB OR ...) AND date AND desc
+    # AND amount. (Doing it the other way round would leave the later accounts
+    # OR-ed in unfiltered.) The multi-account add_guid_list_match isn't usable
+    # from Python -- there's no GList input typemap -- so we OR together single
+    # add_guid_match terms, which is the same binding the single-account path
+    # has always used. For a single account this is exactly one AND term, so the
+    # query is identical to before.
+    for index, search_account in enumerate(accounts):
+        search_account_guid = gnucash.gnucash_core.GUID()
+        gnucash.gnucash_core.GUIDString(
+            search_account.GetGUID().to_string(), search_account_guid)
+        op = QOF_QUERY_AND if index == 0 else QOF_QUERY_OR
+        query.add_guid_match(
+            [SPLIT_ACCOUNT, QOF_PARAM_GUID], search_account_guid, op)
 
     if date_posted_from != None:
         pred_data = gnucash.gnucash_core.QueryDatePredicate(
@@ -1125,13 +1240,29 @@ def getAccountSplits(book, guid, date_posted_from, date_posted_to, limit,
         param_list = [SPLIT_TRANS, TRANS_DATE_POSTED]
         query.add_term(param_list, pred_data, QOF_QUERY_AND)
 
-    SPLIT_ACCOUNT = 'account'
-    QOF_PARAM_GUID = 'guid'
+    # Free-text, case-insensitive substring match on the parent transaction's
+    # description.
+    if description != None:
+        pred_data = gnucash.gnucash_core.QueryStringPredicate(
+            QOF_COMPARE_CONTAINS, description,
+            QOF_STRING_MATCH_CASEINSENSITIVE, False)
+        param_list = [SPLIT_TRANS, TRANS_DESCRIPTION]
+        query.add_term(param_list, pred_data, QOF_QUERY_AND)
 
-    if guid != None:
-        gnucash.gnucash_core.GUIDString(guid, account_guid)
-        query.add_guid_match(
-            [SPLIT_ACCOUNT, QOF_PARAM_GUID], account_guid, QOF_QUERY_AND)
+    # Amount bounds. The numeric predicate compares the absolute value of the
+    # split amount, so the range matches by magnitude regardless of whether the
+    # split is a debit or a credit.
+    if amount_from != None:
+        pred_data = gnucash.gnucash_core.QueryNumericPredicate(
+            QOF_COMPARE_GTE, QOF_NUMERIC_MATCH_ANY,
+            gnc_numeric_from_decimal(Decimal(amount_from)))
+        query.add_term([SPLIT_VALUE], pred_data, QOF_QUERY_AND)
+
+    if amount_to != None:
+        pred_data = gnucash.gnucash_core.QueryNumericPredicate(
+            QOF_COMPARE_LTE, QOF_NUMERIC_MATCH_ANY,
+            gnc_numeric_from_decimal(Decimal(amount_to)))
+        query.add_term([SPLIT_VALUE], pred_data, QOF_QUERY_AND)
 
     # Sort by the transaction's posted date, with the split's own guid as a
     # stable tiebreaker, so that limit/offset paging returns consistent,

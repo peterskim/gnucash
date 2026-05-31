@@ -49,6 +49,49 @@ reconcile_state_label - a human-readable form of reconcile_state
 reconcile_date - the date the split was reconciled or cleared (YYYY-MM-DD), or
 null when it is neither
 
+GET request to /accounts/<guid>/splits/search - searches splits in an account
+(and optionally its subaccounts) by description, posted date and amount
+
+GET vars:
+description - optional - case-insensitive substring match against the parent
+transaction's description; empty or absent applies no constraint
+date_posted_from - optional - only splits whose transaction was posted on or
+after this date (YYYY-MM-DD)
+date_posted_to - optional - only splits whose transaction was posted on or
+before this date (YYYY-MM-DD)
+amount_from - optional - minimum split amount by absolute value, so the sign
+is ignored (both debits and credits of that magnitude match)
+amount_to - optional - maximum split amount by absolute value, so the sign is
+ignored
+include_children - optional - set to "true" (or "1"/"yes") to also search the
+named account's subaccounts recursively; otherwise only the named account is
+searched (default false)
+limit - optional - maximum number of splits to return (default 100, capped at
+500)
+offset - optional - number of splits to skip before returning results (default
+0), used together with limit for pagination
+include - optional - comma-separated list of related objects to embed in each
+split; supported values are "transaction" and "other_split" (default
+"transaction,other_split"). The account is always embedded and cannot be
+omitted; pass an empty value to embed neither transaction nor other_split.
+
+The filters (description, date_posted_from, date_posted_to, amount_from,
+amount_to) are combined with AND - a split must satisfy every filter present to
+be returned. The response, the split shape, the sorting (by transaction posted
+date oldest first, with the split guid as a tiebreaker for stable paging) and
+the reconcile_state/reconcile_state_label/reconcile_date fields are all as
+described for GET /accounts/<guid>/splits:
+{"splits": [...], "total": <total matching splits>, "limit": <limit>,
+"offset": <offset>}
+
+When include_children is false every split embeds the shallow representation
+of the queried account; when it is true each split instead embeds its own
+account, so results from different subaccounts carry their respective accounts.
+
+A non-existent account guid returns 404. A malformed parameter - a date_posted
+value not formatted as YYYY-MM-DD, or a non-numeric amount value - returns an
+HTTP 400 with an {"errors": [...]} object (error type "InvalidSearch").
+
 POST request to /accounts - creates a new account
 
 POST variables:
