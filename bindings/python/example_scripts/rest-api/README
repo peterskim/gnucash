@@ -105,23 +105,31 @@ account's GUID can be obtained from /accounts)
 description - optional - a description for the account
 code - optional - an account code
 
-POST request to /transactions - creates a new transaction (currently with only
-two splits)
+POST request to /transactions - creates a new transaction with any number of
+splits (at least two are required)
 
 POST variables:
 currency  - required - a gnucash currency code e.g. GBP
 description - required - a description for the transaction
 num - optional - a transaction number
 date_posted - required - a date formatted as YYYY-MM-DD
-splitvalue1 - required - the value of the split on splitaccount1 
+splitvalue1 - required - the value of the split on splitaccount1
 splitaccount1 - required - the GUID for the 1st account on this transaction
 (can be obtained from /accounts)
 splitvalue2 - required - the value of the split on splitaccount2
 splitaccount2 - required - the GUID for the 2nd account on this transaction
+splitvalueN/splitaccountN - optional - further splits, numbered 3, 4, ... N.
+Each numbered split adds another posting to the transaction; values are decimal
+amounts in the transaction currency's major units (e.g. "-1.23").
 
-GET request to /transactions/<guid> - returns an individual transaction 
+GET request to /transactions/<guid> - returns an individual transaction
 POST request to /transactions/<guid> - edits an existing transaction (accepts
-the same post variables as /transactions)
+the same post variables as /transactions, plus an optional splitguidN per
+split). This route re-values existing splits; it does not add or remove them.
+When a splitguid is given for every split, each spec is matched to that split by
+guid. When given for none, the number of splits posted must equal the
+transaction's existing split count and they are paired by ascending value.
+Mixing (a guid for some splits but not all) is rejected.
 DELETE request to /transactions/<guid> - deletes a transaction
 
 GET request to /bills - returns a list of bills

@@ -278,14 +278,17 @@ def api_transactions():
         num = str(request.form.get('num', ''))
         date_posted = str(request.form.get('date_posted', ''))
 
-        splitvalue1 = str(request.form.get('splitvalue1', ''))
-        splitaccount1 = str(request.form.get('splitaccount1', ''))
-        splitvalue2 = str(request.form.get('splitvalue2', ''))
-        splitaccount2 = str(request.form.get('splitaccount2', ''))
+        # Accept any number of splits numbered split{value,account}1..N (this
+        # route formerly read exactly two fixed slots). addTransaction is
+        # already split-count agnostic.
+        splits = _parse_form_splits(request.form, include_guid=False)
 
-        splits = [
-            {'value': splitvalue1, 'account_guid': splitaccount1},
-            {'value': splitvalue2, 'account_guid': splitaccount2}]
+        if len(splits) < 2:
+            return Response(json.dumps({'errors': [{'type': 'TooFewSplits',
+                'message': 'A transaction requires at least two splits '
+                '(splitvalue1/splitaccount1, splitvalue2/splitaccount2, ...).',
+                'data': {'field': 'splits'}}]}), status=400,
+                mimetype='application/json')
 
         try:
             transaction = addTransaction(session.book, num, description,
@@ -327,21 +330,19 @@ def api_transaction(guid):
         num = str(request.form.get('num', ''))
         date_posted = str(request.form.get('date_posted', ''))
 
-        splitguid1 = str(request.form.get('splitguid1', ''))
-        splitvalue1 = str(request.form.get('splitvalue1', ''))
-        splitaccount1 = str(request.form.get('splitaccount1', ''))
-        splitguid2 = str(request.form.get('splitguid2', ''))
-        splitvalue2 = str(request.form.get('splitvalue2', ''))
-        splitaccount2 = str(request.form.get('splitaccount2', ''))
+        # Accept any number of splits numbered split{guid,value,account}1..N
+        # (this route formerly read exactly two fixed slots). splitguid* stays
+        # optional per split: editTransaction matches by guid when every split
+        # carries one, otherwise pairs specs to existing splits by value-sorted
+        # position. editTransaction is already split-count agnostic.
+        splits = _parse_form_splits(request.form, include_guid=True)
 
-        splits = [
-            {'guid': splitguid1,
-            'value': splitvalue1,
-            'account_guid': splitaccount1},
-            {'guid': splitguid2,
-            'value': splitvalue2,
-            'account_guid': splitaccount2}
-        ]
+        if len(splits) < 2:
+            return Response(json.dumps({'errors': [{'type': 'TooFewSplits',
+                'message': 'A transaction requires at least two splits '
+                '(splitvalue1/splitaccount1, splitvalue2/splitaccount2, ...).',
+                'data': {'field': 'splits'}}]}), status=400,
+                mimetype='application/json')
 
         try:
             transaction = editTransaction(session.book, guid, num, description,
@@ -2162,6 +2163,46 @@ def addAccount(book, name, currency_mnumonic, account_type_id,
         account.SetCode(code)
 
     return gnucash_simple.accountToDict(account)
+
+def _parse_form_splits(form, include_guid):
+    """Build the splits list for a transaction route from the request form.
+
+    Splits are numbered with a 1-based suffix on each field
+    (splitvalue1/splitaccount1, splitvalue2/splitaccount2, ... splitvalueN/
+    splitaccountN). Any number of splits may be supplied -- this replaces the
+    two routes' former hardcoded pair of slots. Indices need not be contiguous:
+    every index referenced by a relevant split* field is collected and the
+    splits are returned in ascending index order, so a gap never silently drops
+    the splits numbered after it.
+
+    include_guid adds the optional per-split 'guid' (used by the edit route to
+    pair a spec with an existing engine split) and lets a stray splitguid* field
+    contribute an index. It defaults to '', which editTransaction reads as "no
+    guid for this split".
+    """
+    field_names = ['splitvalue', 'splitaccount']
+    if include_guid:
+        field_names.append('splitguid')
+
+    indices = set()
+    for key in form:
+        for name in field_names:
+            suffix = key[len(name):]
+            if key.startswith(name) and suffix.isdigit():
+                indices.add(int(suffix))
+                break
+
+    splits = []
+    for index in sorted(indices):
+        split = {
+            'value': str(form.get('splitvalue%d' % index, '')),
+            'account_guid': str(form.get('splitaccount%d' % index, '')),
+        }
+        if include_guid:
+            split['guid'] = str(form.get('splitguid%d' % index, ''))
+        splits.append(split)
+
+    return splits
 
 def _split_value_to_numeric(raw):
     """Convert a split value from the request form into a GncNumeric.
