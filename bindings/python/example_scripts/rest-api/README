@@ -353,6 +353,11 @@ on success. If re-opening the book fails the server is left with no active
 session and returns 503; all other routes then return 503 until a subsequent
 POST /revert succeeds in re-opening the book.
 
+GET request to /session - reports whether the book has unsaved in-memory
+changes not yet flushed to the backend. The response is an object of the form
+{"dirty": <bool>}, where true means there are changes that a POST /save would
+persist (and a POST /revert would discard). Returns 200 on success.
+
 Usage
 -----
 

@@ -1110,6 +1110,18 @@ def api_revert():
 
     return Response('', status=204, mimetype='application/json')
 
+@app.route('/session', methods=['GET'])
+def api_session():
+
+    # Whether the book has in-memory changes not yet flushed to the backend
+    # (i.e. a POST /save would persist something). Sourced from qof's own
+    # predicate, exposed on Book as session_not_saved() by
+    # add_constructor_and_methods_with_prefix('qof_book_', ...) in gnucash_core.py
+    # (see also example_scripts/simple_book.py). Lets a client show unsaved
+    # state and offer Save/Revert.
+    return Response(json.dumps({'dirty': session.book.session_not_saved()}),
+        status=200, mimetype='application/json')
+
 def getCustomers(book):
 
     query = gnucash.Query()
