@@ -124,12 +124,27 @@ amounts in the transaction currency's major units (e.g. "-1.23").
 
 GET request to /transactions/<guid> - returns an individual transaction
 POST request to /transactions/<guid> - edits an existing transaction (accepts
-the same post variables as /transactions, plus an optional splitguidN per
-split). This route re-values existing splits; it does not add or remove them.
-When a splitguid is given for every split, each spec is matched to that split by
-guid. When given for none, the number of splits posted must equal the
-transaction's existing split count and they are paired by ascending value.
-Mixing (a guid for some splits but not all) is rejected.
+the same post variables as /transactions, plus an optional splitguidN per split,
+plus allow_reconciled_removal). The splitguidN values returned for each split by
+GET /transactions/<guid> select how splits are matched and whether the split
+count may change:
+
+- guid mode (a splitguidN is supplied for AT LEAST ONE split):
+  * a split posted WITH a splitguid re-values that existing split in place,
+    preserving its reconcile state and memo;
+  * a split posted with an EMPTY splitguid is added as a new split;
+  * an existing split whose guid is not posted by any spec is removed.
+  So to change the number of splits, echo back the splitguid of every split you
+  want to keep, omit a splitguid to add a split, and drop a guid to remove one.
+- position mode (NO splitguidN is supplied for any split): the number of splits
+  posted must equal the transaction's existing split count, and they are paired
+  by ascending value. This mode cannot add or remove splits.
+
+The posted split values must sum to zero (the transaction must balance) or the
+edit is rejected. Removing a split that has been reconciled is refused unless
+allow_reconciled_removal is set to 1.
+
+allow_reconciled_removal - optional - 1 permits removing a reconciled split
 DELETE request to /transactions/<guid> - deletes a transaction
 
 GET request to /bills - returns a list of bills

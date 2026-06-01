@@ -331,11 +331,19 @@ def api_transaction(guid):
         date_posted = str(request.form.get('date_posted', ''))
 
         # Accept any number of splits numbered split{guid,value,account}1..N
-        # (this route formerly read exactly two fixed slots). splitguid* stays
-        # optional per split: editTransaction matches by guid when every split
-        # carries one, otherwise pairs specs to existing splits by value-sorted
-        # position. editTransaction is already split-count agnostic.
+        # (this route formerly read exactly two fixed slots). splitguid* is
+        # optional per split and selects how editTransaction matches: if ANY
+        # split carries a guid, guid mode applies (guid -> re-value that split,
+        # empty guid -> add a split, an existing split whose guid is omitted ->
+        # remove it); if none do, specs pair with the existing splits by
+        # value-sorted position and the count must stay the same. So changing the
+        # number of splits requires per-split guids.
         splits = _parse_form_splits(request.form, include_guid=True)
+
+        # Removing a reconciled split is refused unless the caller opts in.
+        allow_reconciled_removal = str(
+            request.form.get('allow_reconciled_removal', '')).lower() in (
+            '1', 'true', 'yes')
 
         if len(splits) < 2:
             return Response(json.dumps({'errors': [{'type': 'TooFewSplits',
@@ -346,7 +354,7 @@ def api_transaction(guid):
 
         try:
             transaction = editTransaction(session.book, guid, num, description,
-                date_posted, currency, splits)
+                date_posted, currency, splits, allow_reconciled_removal)
         except Error as error:
             return Response(json.dumps({'errors': [{'type' : error.type,
                 'message': error.message, 'data': error.data}]}), status=400, mimetype='application/json')
@@ -2204,13 +2212,15 @@ def _parse_form_splits(form, include_guid):
 
     return splits
 
-def _split_value_to_numeric(raw):
-    """Convert a split value from the request form into a GncNumeric.
+def _split_value_to_decimal(raw):
+    """Parse a split value from the request form into a Decimal.
 
     The web client sends the value as a decimal string in the transaction
     currency's *major* units (e.g. "-1.23", "5") - not as a hardcoded count of
     cents. Anything that isn't a finite decimal raises Error (-> HTTP 400)
-    rather than escaping as an uncaught ValueError (-> opaque 500).
+    rather than escaping as an uncaught ValueError (-> opaque 500). The Decimal
+    is returned (not just the converted GncNumeric) so callers can sum split
+    values exactly to check that a transaction balances.
     """
     try:
         value = Decimal(raw)
@@ -2220,7 +2230,11 @@ def _split_value_to_numeric(raw):
         raise Error('InvalidSplitValue',
             'A valid decimal value must be supplied for this split',
             {'field': 'value'})
-    return gnc_numeric_from_decimal(value)
+    return value
+
+def _split_value_to_numeric(raw):
+    """Convert a split value from the request form into a GncNumeric."""
+    return gnc_numeric_from_decimal(_split_value_to_decimal(raw))
 
 def _set_split_value(split, account, value, currency):
     """Set a split's value (in transaction currency) and, when the account is
@@ -2308,7 +2322,7 @@ def getTransaction(book, transaction_guid):
         return gnucash_simple.transactionToDict(transaction, ['splits'])
 
 def editTransaction(book, transaction_guid, num, description, date_posted,
-    currency_mnumonic, splits):
+    currency_mnumonic, splits, allow_reconciled_removal=False):
 
     guid = gnucash.gnucash_core.GUID() 
     gnucash.gnucash_core.GUIDString(transaction_guid, guid)
@@ -2335,63 +2349,97 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
             'The date posted must be provided in the form YYYY-MM-DD',
             {'field': 'date_posted'})
 
-    # Each incoming spec must be matched to an engine Split to re-value in place
-    # (which preserves that split's reconcile state and memo). Two ways to match:
-    #   - by guid, when the caller supplies splitguid* for EVERY split; or
-    #   - by position, pairing the specs with the transaction's existing splits
-    #     sorted by ascending value -- the same "from"(negative)/"to"(positive)
-    #     ordering the web editor derives. This lets clients that don't track
-    #     split guids (e.g. the web app) edit a transaction without a 400.
-    # Mixed (some guids, some not) is rejected: it would otherwise silently fall
-    # back to position matching and could re-value the wrong split.
-    guids = [s.get('guid') for s in splits]
-    if all(guids):
-        use_guids = True
-    elif any(guids):
-        raise Error('MixedSplitGuids',
-            'Either supply a guid for every split or for none of them',
+    # A transaction the engine marks read-only must not be edited: split removal
+    # in particular silently no-ops (xaccSplitDestroy returns FALSE for a
+    # read-only parent) and the value setters would be ignored too, so reject up
+    # front rather than return a misleading 200 with the edit not applied.
+    if transaction.GetReadOnly():
+        raise Error('TransactionReadOnly',
+            'This transaction is read-only and cannot be edited',
             {'field': 'guid'})
-    else:
-        use_guids = False
+
+    # Each incoming spec is matched to the transaction's splits to decide what to
+    # keep, add or remove. Two matching modes:
+    #   - guid mode (ANY spec carries a splitguid*): a spec WITH a guid re-values
+    #     that existing split in place (preserving its reconcile state and memo);
+    #     a spec with an EMPTY guid creates a new split; and any existing split
+    #     whose guid no spec names is removed. This is how the split COUNT can
+    #     change -- the caller echoes back the guids it wants to keep (from
+    #     splitToDict), omits a guid to add a split, and drops a guid to remove
+    #     one.
+    #   - position mode (NO spec carries a guid): existing splits are paired with
+    #     the specs by ascending value -- the same "from"(negative)/"to"(positive)
+    #     ordering the web editor derives, for clients that don't track guids.
+    #     Value is not a stable identity, so this mode cannot tell an added split
+    #     from a removed one: it stays count-locked (re-value only). Changing the
+    #     count requires guid mode.
+    guids = [s.get('guid') for s in splits]
+    use_guids = any(guids)
+
+    # Snapshot the existing splits once, into a plain Python list, BEFORE opening
+    # the edit: we must not mutate the live GetSplitList() while destroying
+    # splits, and resolving against a snapshot keeps a bad request from leaving
+    # the transaction stuck in BeginEdit.
+    existing = list(transaction.GetSplitList())
 
     if not use_guids:
-        # Pairing specs with existing splits needs an equal count so we never
-        # strand an existing split (which would unbalance the transaction).
-        existing_sorted = sorted(transaction.GetSplitList(),
+        # Position mode pairs specs to existing splits 1:1, so the counts must
+        # match; an unequal count here is really a request to add or remove,
+        # which needs guid mode.
+        existing_sorted = sorted(existing,
             key=lambda s: s.GetValue().to_double())
         if len(existing_sorted) != len(splits):
             raise Error('SplitCountMismatch',
-                'This transaction has %d splits; editing it requires either '
-                'the same number of splits or a guid for each split.'
+                'This transaction has %d splits; editing it without per-split '
+                'guids requires the same number of splits. Supply a splitguid '
+                'for every split to add or remove splits.'
                 % len(existing_sorted),
                 {'field': 'splits'})
 
-    # Resolve every (split, account, value) BEFORE opening the transaction for
-    # edit, so a bad request can't leave it stuck in BeginEdit.
+    # Resolve every (split, account, value, decimal) BEFORE opening the
+    # transaction for edit. split is None for a spec that should create a NEW
+    # split. kept_guids records which existing splits a spec re-uses, so the rest
+    # can be removed.
     transaction_guid_str = transaction.GetGUID().to_string()
     resolved = []
+    kept_guids = set()
     for index, split_values in enumerate(splits):
 
         if use_guids:
-            split_guid = gnucash.gnucash_core.GUID()
-            gnucash.gnucash_core.GUIDString(split_values['guid'], split_guid)
+            spec_guid = split_values.get('guid')
+            if spec_guid:
+                split_guid = gnucash.gnucash_core.GUID()
+                gnucash.gnucash_core.GUIDString(spec_guid, split_guid)
 
-            split = split_guid.SplitLookup(book)
+                split = split_guid.SplitLookup(book)
 
-            if split is None:
-                raise Error('InvalidSplitGuid',
-                    'A valid guid must be supplied for this split',
-                    {'field': 'guid'})
+                if split is None:
+                    raise Error('InvalidSplitGuid',
+                        'A valid guid must be supplied for this split',
+                        {'field': 'guid'})
 
-            # The split must already belong to THIS transaction; otherwise
-            # SetParent below would silently move it out of its own
-            # transaction, unbalancing both.
-            parent = split.GetParent()
-            if parent is None or \
-                    parent.GetGUID().to_string() != transaction_guid_str:
-                raise Error('InvalidSplitGuid',
-                    'This split does not belong to the transaction being edited',
-                    {'field': 'guid'})
+                # The split must already belong to THIS transaction; otherwise
+                # SetParent below would silently move it out of its own
+                # transaction, unbalancing both.
+                parent = split.GetParent()
+                if parent is None or \
+                        parent.GetGUID().to_string() != transaction_guid_str:
+                    raise Error('InvalidSplitGuid',
+                        'This split does not belong to the transaction being '
+                        'edited', {'field': 'guid'})
+
+                split_guid_str = split.GetGUID().to_string()
+                # The same existing split named twice would collapse two specs
+                # into one survivor (and could drop the transaction below two
+                # splits) -- reject rather than silently merge.
+                if split_guid_str in kept_guids:
+                    raise Error('DuplicateSplitGuid',
+                        'The same split guid was supplied more than once',
+                        {'field': 'guid'})
+                kept_guids.add(split_guid_str)
+            else:
+                # Empty guid in guid mode -> create a new split.
+                split = None
         else:
             split = existing_sorted[index]
 
@@ -2406,19 +2454,67 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
                 'A valid account must be supplied for this split',
                 {'field': 'account'})
 
-        value = _split_value_to_numeric(split_values['value'])
-        resolved.append((split, account, value))
+        decimal_value = _split_value_to_decimal(split_values['value'])
+        value = gnc_numeric_from_decimal(decimal_value)
+        resolved.append((split, account, value, decimal_value))
+
+    # Existing splits no spec named (guid mode only) are to be removed.
+    to_destroy = [s for s in existing
+        if s.GetGUID().to_string() not in kept_guids] if use_guids else []
+
+    # Every resolved spec yields exactly one surviving split and duplicates are
+    # rejected, so len(resolved) is the post-edit split count. Guard it
+    # explicitly: the route's len(splits) >= 2 floor counts incoming specs, but a
+    # guid-mode edit that removes splits could otherwise leave a one-sided
+    # transaction.
+    if len(resolved) < 2:
+        raise Error('TooFewSplits',
+            'A transaction requires at least two splits',
+            {'field': 'splits'})
+
+    # The supplied split values must balance (sum to zero in the transaction
+    # currency). The engine would otherwise silently scrub an imbalanced
+    # transaction by injecting an Imbalance-<CUR> split at commit; removing a
+    # split without rebalancing the rest is the easy way to trip this, so reject
+    # it loudly. Summed as Decimals so the check is exact.
+    if sum((d for _, _, _, d in resolved), Decimal(0)) != 0:
+        raise Error('UnbalancedTransaction',
+            'The supplied split values must sum to zero',
+            {'field': 'splits'})
+
+    # Removing a reconciled split silently breaks a completed reconciliation and
+    # the engine performs no check of its own (only the GUI warns). Refuse unless
+    # the caller explicitly opts in with allow_reconciled_removal.
+    if not allow_reconciled_removal:
+        if any(s.GetReconcile() == 'y' for s in to_destroy):
+            raise Error('ReconciledSplitRemoval',
+                'Removing a reconciled split requires '
+                'allow_reconciled_removal=1',
+                {'field': 'splits'})
 
     transaction.BeginEdit()
     try:
-        # Set the currency before re-valuing splits so values store against the
+        # Set the currency before (re-)valuing splits so values store against the
         # right denominator (matches addTransaction).
         transaction.SetCurrency(currency)
 
-        for split, account, value in resolved:
-            split.SetAccount(account)
-            split.SetParent(transaction)
+        for split, account, value, _ in resolved:
+            if split is None:
+                # ADD: mirror addTransaction's create path.
+                split = Split(book)
+                split.SetParent(transaction)
+                split.SetAccount(account)
+            else:
+                # KEEP / re-value an existing split.
+                split.SetAccount(account)
+                split.SetParent(transaction)
             _set_split_value(split, account, value, currency)
+
+        # REMOVE the splits no spec named. xaccSplitDestroy marks them and the
+        # actual detach happens at the CommitEdit below; do it after (re-)valuing
+        # so the transaction is balanced once, at the single CommitEdit.
+        for split in to_destroy:
+            split.Destroy()
 
         transaction.SetDescription(description)
         transaction.SetNum(num)
