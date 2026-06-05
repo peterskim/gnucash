@@ -121,6 +121,16 @@ splitaccount2 - required - the GUID for the 2nd account on this transaction
 splitvalueN/splitaccountN - optional - further splits, numbered 3, 4, ... N.
 Each numbered split adds another posting to the transaction; values are decimal
 amounts in the transaction currency's major units (e.g. "-1.23").
+splitquantityN - optional - the amount of split N in its account's OWN commodity
+(e.g. the number of shares for a stock account), as a decimal string. Only
+meaningful when splitaccountN's commodity differs from the transaction currency;
+supplying it for a same-currency account (where the amount always equals the
+value) returns an HTTP 400 with error type "UnexpectedSplitQuantity". The sign is
+normalized to follow the split value's sign so the implied price
+(|value|/|quantity|) is positive, and the quantity is snapped to the commodity's
+smallest fraction (SCU). Omit it to leave the split's amount unset (the legacy
+behavior, which leaves a foreign-commodity account's balance unchanged). Only the
+split values must sum to zero; quantities are not constrained by the balance.
 
 GET request to /transactions/<guid> - returns an individual transaction
 POST request to /transactions/<guid> - edits an existing transaction (accepts

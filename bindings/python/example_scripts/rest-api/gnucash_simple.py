@@ -334,8 +334,14 @@ def accountToDictShallow(account):
         simple_account['guid'] = account.GetGUID().to_string()
         if account.GetCommodity() == None:
             simple_account['currency'] = ''
+            simple_account['currency_namespace'] = None
         else:
             simple_account['currency'] = account.GetCommodity().get_mnemonic()
+            # The commodity's namespace (e.g. "CURRENCY", "NASDAQ", "All
+            # non-currency") disambiguates a mnemonic reused across exchanges, so
+            # a recorded price attaches to the security the account actually holds.
+            simple_account['currency_namespace'] = \
+                account.GetCommodity().get_namespace()
 
         return simple_account
 
@@ -354,8 +360,14 @@ def accountToDict(account):
         simple_account['guid'] = account.GetGUID().to_string()
         if account.GetCommodity() == None:
             simple_account['currency'] = ''
+            simple_account['currency_namespace'] = None
         else:
             simple_account['currency'] = account.GetCommodity().get_mnemonic()
+            # The commodity's namespace (e.g. "CURRENCY", "NASDAQ", "All
+            # non-currency") disambiguates a mnemonic reused across exchanges, so
+            # a recorded price attaches to the security the account actually holds.
+            simple_account['currency_namespace'] = \
+                account.GetCommodity().get_namespace()
         simple_account['subaccounts'] = []
         for n, subaccount in enumerate(account.get_children_sorted()):
             simple_account['subaccounts'].append(accountToDict(subaccount))

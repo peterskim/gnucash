@@ -182,7 +182,8 @@ def api_account_splits(guid):
     # shallow account dict once (from the dict getAccount already computed) and
     # reuse it for every row instead of re-serialising the account each time.
     account_dict = dict((key, account[key]) for key in
-        ('guid', 'name', 'type_id', 'description', 'currency')
+        ('guid', 'name', 'type_id', 'description', 'currency',
+            'currency_namespace')
         if key in account)
 
     splits, total = getAccountSplits(session.book, guid, date_posted_from,
@@ -249,7 +250,8 @@ def api_account_splits_search(guid):
         account_dict = None
     else:
         account_dict = dict((key, account[key]) for key in
-            ('guid', 'name', 'type_id', 'description', 'currency')
+            ('guid', 'name', 'type_id', 'description', 'currency',
+            'currency_namespace')
             if key in account)
 
     # The query helper parses the date strings and amount values; surface
@@ -2188,7 +2190,7 @@ def _parse_form_splits(form, include_guid):
     contribute an index. It defaults to '', which editTransaction reads as "no
     guid for this split".
     """
-    field_names = ['splitvalue', 'splitaccount']
+    field_names = ['splitvalue', 'splitaccount', 'splitquantity']
     if include_guid:
         field_names.append('splitguid')
 
@@ -2205,6 +2207,10 @@ def _parse_form_splits(form, include_guid):
         split = {
             'value': str(form.get('splitvalue%d' % index, '')),
             'account_guid': str(form.get('splitaccount%d' % index, '')),
+            # Optional amount in the account's OWN commodity (e.g. a number of
+            # shares); only meaningful when that commodity differs from the
+            # transaction currency. '' means "not supplied" (legacy behavior).
+            'quantity': str(form.get('splitquantity%d' % index, '')),
         }
         if include_guid:
             split['guid'] = str(form.get('splitguid%d' % index, ''))
@@ -2236,19 +2242,80 @@ def _split_value_to_numeric(raw):
     """Convert a split value from the request form into a GncNumeric."""
     return gnc_numeric_from_decimal(_split_value_to_decimal(raw))
 
-def _set_split_value(split, account, value, currency):
-    """Set a split's value (in transaction currency) and, when the account is
-    denominated in that same currency, its amount too. GnuCash derives account
-    balances from split *amounts* (in the account's own commodity), so a split
-    with a value but no amount would leave the account balance unchanged. For a
-    foreign-commodity account the amount needs an exchange rate we don't have
-    here, so we leave it for the user; the value still keeps the txn balanced."""
+def _split_quantity_to_numeric(raw, account):
+    """Convert a split quantity (the amount in the account's OWN commodity, e.g.
+    a number of shares) from the request form into a GncNumeric, snapped to the
+    commodity's smallest fraction (SCU) the way the GnuCash GUI stores it.
+
+    A non-finite/garbage quantity raises Error (-> HTTP 400) rather than escaping
+    as an uncaught exception."""
+    try:
+        quantity = Decimal(raw)
+    except (ArithmeticError, ValueError, TypeError):
+        quantity = None
+    if quantity is None or not quantity.is_finite():
+        raise Error('InvalidSplitQuantity',
+            'A valid decimal quantity must be supplied for this split',
+            {'field': 'quantity'})
+    numeric = gnc_numeric_from_decimal(quantity)
+    # Snap to the commodity's SCU (e.g. 1/10000 for a 4-dp stock) so the stored
+    # amount matches GnuCash's canonical denominator: a clean share count
+    # converts losslessly, and any excess decimals round half-up.
+    commodity = account.GetCommodity()
+    if commodity is not None:
+        fraction = commodity.get_fraction()
+        if fraction and fraction > 0:
+            numeric = numeric.convert(
+                fraction, gnucash_core_c.GNC_HOW_RND_ROUND_HALF_UP)
+    return numeric
+
+def _resolve_split_quantity(split_values, account, value, currency):
+    """Resolve the optional per-split quantity (amount in the account's own
+    commodity) for the add/edit routes. Returns a GncNumeric, or None when no
+    quantity was supplied (legacy behavior). Shared by addTransaction and
+    editTransaction.
+
+    A quantity is only meaningful for an account whose commodity differs from
+    the transaction currency; for a same-currency account the amount always
+    equals the value, so supplying one is a client error and is rejected. The
+    quantity's sign is normalized to follow the value's (buy: +value/+shares;
+    sell: -value/-shares) so the implied price (|value|/|quantity|) is positive."""
+    raw = split_values.get('quantity', '')
+    if raw == '':
+        return None
+    commodity = account.GetCommodity()
+    if commodity is not None and commodity.equiv(currency):
+        raise Error('UnexpectedSplitQuantity',
+            'A split quantity may only be supplied for an account whose '
+            'commodity differs from the transaction currency',
+            {'field': 'quantity'})
+    quantity = _split_quantity_to_numeric(raw, account)
+    v = value.to_double()
+    q = quantity.to_double()
+    if (v < 0 and q > 0) or (v > 0 and q < 0):
+        quantity = quantity.neg()
+    return quantity
+
+def _set_split_value(split, account, value, currency, quantity=None):
+    """Set a split's value (in transaction currency) and its amount (in the
+    account's own commodity). GnuCash derives account balances from split
+    *amounts*, so a split with a value but no amount leaves the balance
+    unchanged. Three cases:
+
+      - account commodity == transaction currency: amount == value.
+      - account commodity != currency AND a quantity was supplied (a stock /
+        fund / crypto / foreign-currency split): amount = that quantity (e.g.
+        the number of shares); the implied price is value/quantity.
+      - account commodity != currency and NO quantity: leave the amount unset
+        (legacy behavior) -- the value still keeps the transaction balanced."""
     split.SetValue(value)
     # GetCommodity() is None for accounts that hold no commodity (the book root,
     # and some placeholder accounts); guard so we never dereference None.
     commodity = account.GetCommodity()
     if commodity is not None and commodity.equiv(currency):
         split.SetAmount(value)
+    elif quantity is not None:
+        split.SetAmount(quantity)
 
 def addTransaction(book, num, description, date_posted, currency_mnumonic, splits):
 
@@ -2282,7 +2349,8 @@ def addTransaction(book, num, description, date_posted, currency_mnumonic, split
                 {'field': 'account'})
 
         value = _split_value_to_numeric(split_values['value'])
-        resolved.append((account, value))
+        quantity = _resolve_split_quantity(split_values, account, value, currency)
+        resolved.append((account, value, quantity))
 
     transaction = Transaction(book)
     transaction.BeginEdit()
@@ -2291,11 +2359,11 @@ def addTransaction(book, num, description, date_posted, currency_mnumonic, split
         # against the right denominator.
         transaction.SetCurrency(currency)
 
-        for account, value in resolved:
+        for account, value, quantity in resolved:
             split = Split(book)
             split.SetParent(transaction)
             split.SetAccount(account)
-            _set_split_value(split, account, value, currency)
+            _set_split_value(split, account, value, currency, quantity)
 
         transaction.SetDescription(description)
         transaction.SetNum(num)
@@ -2456,7 +2524,8 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
 
         decimal_value = _split_value_to_decimal(split_values['value'])
         value = gnc_numeric_from_decimal(decimal_value)
-        resolved.append((split, account, value, decimal_value))
+        quantity = _resolve_split_quantity(split_values, account, value, currency)
+        resolved.append((split, account, value, decimal_value, quantity))
 
     # Existing splits no spec named (guid mode only) are to be removed.
     to_destroy = [s for s in existing
@@ -2477,7 +2546,7 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
     # transaction by injecting an Imbalance-<CUR> split at commit; removing a
     # split without rebalancing the rest is the easy way to trip this, so reject
     # it loudly. Summed as Decimals so the check is exact.
-    if sum((d for _, _, _, d in resolved), Decimal(0)) != 0:
+    if sum((d for _, _, _, d, _ in resolved), Decimal(0)) != 0:
         raise Error('UnbalancedTransaction',
             'The supplied split values must sum to zero',
             {'field': 'splits'})
@@ -2498,7 +2567,7 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
         # right denominator (matches addTransaction).
         transaction.SetCurrency(currency)
 
-        for split, account, value, _ in resolved:
+        for split, account, value, _, quantity in resolved:
             if split is None:
                 # ADD: mirror addTransaction's create path.
                 split = Split(book)
@@ -2508,7 +2577,7 @@ def editTransaction(book, transaction_guid, num, description, date_posted,
                 # KEEP / re-value an existing split.
                 split.SetAccount(account)
                 split.SetParent(transaction)
-            _set_split_value(split, account, value, currency)
+            _set_split_value(split, account, value, currency, quantity)
 
         # REMOVE the splits no spec named. xaccSplitDestroy marks them and the
         # actual detach happens at the CommitEdit below; do it after (re-)valuing
